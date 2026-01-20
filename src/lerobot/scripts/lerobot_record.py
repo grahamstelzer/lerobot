@@ -461,7 +461,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 image_writer_processes=cfg.dataset.num_image_writer_processes,
                 image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                vcodec=cfg.dataset.vcodec,
             )
 
         # Load pretrained policy
@@ -555,7 +554,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             listener.stop()
 
         if cfg.dataset.push_to_hub:
-            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+            # dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+            pass
 
         log_say("Exiting", cfg.play_sounds)
     return dataset
