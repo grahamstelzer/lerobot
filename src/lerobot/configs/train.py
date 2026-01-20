@@ -136,9 +136,13 @@ class TrainPipelineConfig(HubMixin):
             self.scheduler = self.policy.get_scheduler_preset()
 
         if self.policy.push_to_hub and not self.policy.repo_id:
-            raise ValueError(
-                "'policy.repo_id' argument missing. Please specify it to push the model to the hub."
-            )
+
+            self.policy.push_to_hub = False
+            
+
+            # raise ValueError(
+            #     "'policy.repo_id' argument missing. Please specify it to push the model to the hub."
+            # )
 
         if self.use_rabc and not self.rabc_progress_path:
             # Auto-detect from dataset path

@@ -12,7 +12,7 @@ MAX_STEPS_PER_EPISODE = 20
 
 
 def main():
-    device = torch.device("mps")  # or "cuda" or "cpu"
+    device = torch.device("cuda")  # or "cuda" or "cpu"
     model_id = "lerobot/smolvla_base"
 
     model = SmolVLAPolicy.from_pretrained(model_id)
