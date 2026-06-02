@@ -31,7 +31,11 @@ from lerobot.utils.import_utils import _transformers_available
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
-    from transformers.models.gemma import modeling_gemma
+
+
+    from transformers.models.gemma import modeling_gemma # eager attention function and apply_rotary_pos_emb are imported from here
+
+
     from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
     from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
@@ -99,6 +103,11 @@ def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact 
 
 
 def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (exact copy)
+
+
+    print("PI05: inside make_att_2d_masks, shapes - pad_masks:", pad_masks.shape, "att_masks:", att_masks.shape)
+
+
     """Copied from big_vision.
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
@@ -147,6 +156,12 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     width: int,
     mode: str = "bilinear",
 ) -> torch.Tensor:
+
+
+    print("PI05: inside resize_with_pad_torch, input shape:", images.shape)
+
+
+
     """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
     by padding with black. If the image is float32, it must be in the range [-1, 1].
 
@@ -219,6 +234,11 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
 ):
+
+
+    print("PI05: inside compute_layer_complete, layer_idx:", layer_idx, "inputs_embeds shapes:", [ie.shape for ie in inputs_embeds])
+
+
     models = [paligemma.language_model, gemma_expert.model]
     query_states = []
     key_states = []
@@ -420,6 +440,11 @@ class PaliGemmaWithExpertModel(
                 param.requires_grad = False
 
     def train(self, mode: bool = True):
+
+
+        print("PI05: inside PaliGemmaWithExpertModel.train, mode:", mode)
+
+
         super().train(mode)
         if self.freeze_vision_encoder:
             self.paligemma.vision_tower.eval()
@@ -441,6 +466,11 @@ class PaliGemmaWithExpertModel(
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
     ):
+
+
+        print("PI05: inside PaliGemmaWithExpertModel.forward, inputs_embeds shapes:", [ie.shape if ie is not None else None for ie in inputs_embeds], "attention_mask shape:", attention_mask.shape if attention_mask is not None else None, "position_ids shape:", position_ids.shape if position_ids is not None else None)
+
+
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
@@ -583,6 +613,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         except ImportError:
             raise ValueError(msg) from None
 
+
+
+
+
+
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
@@ -654,6 +690,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Process language tokens
         def lang_embed_func(tokens):
+
+
+
+            print("PI05: inside lang_embed_func, tokens shape:", tokens.shape)
+
+
+
             lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
@@ -675,6 +718,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions, timestep):
+
+
+        print("PI05: inside embed_suffix, noisy_actions shape:", noisy_actions.shape, "timestep shape:", timestep.shape)
+
+
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -722,6 +770,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+
+
+        print("PI05: inside PI05Pytorch.forward, images shape:", images.shape, "img_masks shape:", img_masks.shape, "tokens shape:", tokens.shape, "masks shape:", masks.shape, "actions shape:", actions.shape, "noise shape:", noise.shape if noise is not None else None, "time shape:", time.shape if time is not None else None)
+
+
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -788,6 +841,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
+
+
+        print("PI05: inside sample_actions")
+        def hook_fn(module, input, output):
+            print(f"ATTN_DEBUG gemma layer17 output shape: {output[0].shape}")
+        handle = self.paligemma_with_expert.gemma_expert.model.layers[17].register_forward_hook(hook_fn)
+        
+
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -804,6 +865,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+
+
+        # after embed_prefix returns:
+        tokens_per_cam = prefix_embs.shape[1] - tokens.shape[1]  # total img tokens
+        print(f"ATTN_DEBUG prefix breakdown: total={prefix_embs.shape[1]}, img={tokens_per_cam}, lang={tokens.shape[1]}, per_cam={tokens_per_cam // len(images)}")
+
+
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -818,10 +886,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
+
+        # this should show kv cache for each layer, with shapes like (bsize, num_heads, prefix_len, head_dim) for both key and value
+        print(f"ATTN_DEBUG past_key_values: {len(past_key_values)} layers, key shape: {past_key_values[0][0].shape}")
+
+
+
         dt = -1.0 / num_steps
 
         x_t = noise
         for step in range(num_steps):
+
+
+            print("PI05: inside sample_actions loop, step:", step, "x_t shape:", x_t.shape)
+
+
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
@@ -854,6 +933,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+
+
+
+        handle.remove()
+
+
         return x_t
 
     def denoise_step(
@@ -863,8 +948,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t,
         timestep,
     ):
+
+
+        print("PI05: inside denoise_step, x_t shape:", x_t.shape, "timestep shape:", timestep.shape)
+
+
+
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+
+        print(f"ATTN_DEBUG prefix_len={prefix_pad_masks.shape[1]}, suffix_len={suffix_embs.shape[1]}")
+
+
+
+
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -892,6 +989,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
+
+
+
+        print(f"ATTN_DEBUG denoise_step: prefix_len={prefix_len}, suffix_len={suffix_len}, attn_mask={full_att_2d_masks_4d.shape}")
+
+
         return self.action_out_proj(suffix_out)
 
 
@@ -1103,6 +1206,12 @@ class PI05Policy(PreTrainedPolicy):
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
+
+
+        print("PI05: inside get_optim_params, returning model parameters for optimization")
+        print(f"PI05: model parameters: {[name for name, _ in self.model.named_parameters()]}")
+
+
         return self.parameters()
 
     def reset(self):
@@ -1113,12 +1222,23 @@ class PI05Policy(PreTrainedPolicy):
         }
 
     def init_rtc_processor(self):
+
+
+        print("PI05: inside init_rtc_processor, initializing RTC processor if enabled in config")
+
+
+
         """Initialize RTC processor if RTC is enabled in config."""
         self.rtc_processor = None
 
         # Create processor if config provided
         # If RTC is not enabled - we can still track the denoising data
         if self.config.rtc_config is not None:
+
+
+            print("PI05: RTC config provided, initializing RTC processor")
+
+
             self.rtc_processor = RTCProcessor(self.config.rtc_config)
 
             model_value = getattr(self, "model", None)
@@ -1134,6 +1254,13 @@ class PI05Policy(PreTrainedPolicy):
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
         """
+
+
+
+        print("PI05: inside PI05Policy._preprocess_images, batch keys:", batch.keys())
+
+
+
         images = []
         img_masks = []
 
@@ -1151,6 +1278,11 @@ class PI05Policy(PreTrainedPolicy):
 
         # Preprocess image features present in the batch
         for key in present_img_keys:
+
+
+            print(f"PI05: preprocessing image feature: {key}, original shape: {batch[key].shape}, dtype: {batch[key].dtype}")
+
+
             img = batch[key]
 
             # Ensure tensor is on the same device as the model
@@ -1201,6 +1333,13 @@ class PI05Policy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+
+
+
+        print("PI05: inside select_action, batch keys:", batch.keys())
+
+
+
         """Select a single action given environment observations."""
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
@@ -1218,6 +1357,13 @@ class PI05Policy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+
+
+
+        print("PI05: inside predict_action_chunk, batch keys:", batch.keys(), "kwargs:", kwargs)
+
+
+
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
@@ -1235,6 +1381,12 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+
+
+        print("PI05: inside PI05Policy.forward, batch keys:", batch.keys(), "reduction:", reduction)
+
+
+
         """Run the batch through the model and compute the loss for training.
 
         Args:
