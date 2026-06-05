@@ -26,6 +26,13 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 
+
+# used for attention heatmaps:
+import cv2
+import imageio
+
+
+
 # use for profling
 from torch.profiler import profile, ProfilerActivity, record_function, tensorboard_trace_handler
 
@@ -48,7 +55,8 @@ from lerobot.utils.utils import get_safe_torch_device, init_logging
 from pathlib import Path
 
 
-
+# use for attn visualziation at end of inference
+viz_frames = []
 
 
 # ─────────────────────────────────────────────
@@ -67,17 +75,17 @@ DATASET_PATH = "grahamwichhh/v5_pick-up-cube"   # training dataset, ONLY needed 
 
 TASK         = "Grasp the cube."              # natural language prompt passed to the VLA model
 DEVICE       = "cuda"                       # "cuda", "mps", or "cpu"
-FPS          = 60                           # control loop frequency
-RUN_TIME_S   = 180                           # how long to run inference (seconds)
+FPS          = 30                           # control loop frequency
+RUN_TIME_S   = 120                          # how long to run inference (seconds)
 
 
 # camera ports senmt to OpenCVCameraConfig require Path objects:
 CAMERA_VIDEO_1 = Path("/dev/video0") # front view
-CAMERA_VIDEO_2 = Path("/dev/video4") # 45 degree side view
-CAMERA_VIDEO_3 = Path("/dev/video6") # wrist cam
+CAMERA_VIDEO_2 = Path("/dev/video2") # 45 degree side view
+CAMERA_VIDEO_3 = Path("/dev/video4") # wrist cam
 
 ROBOT_CONFIG = so_follower.SO101FollowerConfig(
-    port="/dev/ttyACM1",
+    port="/dev/ttyACM0",
     id="rocky",                                          # must match th ASDDSAe id used during calibration
     calibration_dir=Path("~/.cache/huggingface/lerobot/calibration/robots/so_follower").expanduser(),
     cameras={
@@ -405,6 +413,9 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
     # max_delta_deg = max_joint_vel_deg_per_s / FPS    # a possible result is moving 15 (units?) rather than 34 in a single second
 
 
+
+
+
     while timestamp < run_time_s:
         loop_start_t = time.perf_counter()
 
@@ -479,24 +490,6 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
         """
 
 
-        # print("\n\nobservation_frame")
-        # print(observation_frame)
-        # # print("\n\npolicy:")
-        # # print(policy)
-        # print("\n\ndevice")
-        # print(device)
-        # print("\n\npreprocessor")
-        # print(preprocessor)
-        # print("\n\npostprocessor")
-        # print(postprocessor)
-        # print("\n\ntask")
-        # print(task)
-        # print("\n\nrobot_type")
-        # print(robot.robot_type)
-
-        # exit()
-
-
 
 
         action_values = predict_action(
@@ -510,8 +503,55 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
             robot_type=robot.robot_type,
         )
 
-
         t3 = time.perf_counter() # check how long it takes to prediction the action
+
+
+
+
+
+        # extract_attention_heatmaps lives in modeling_pi05 and reads the buffer
+        # snapshot that sample_actions stored on the model after the denoising loop.
+        # We pass the raw camera frames from obs so the overlay is on original resolution.
+        from lerobot.policies.pi05.modeling_pi05 import extract_attention_heatmaps
+
+        attn_snapshot = getattr(policy.model, "last_attn_buffer_snapshot", None)
+        if attn_snapshot:
+            # Build raw_camera_frames list in the same order as the model's camera keys
+            raw_frames = [
+                obs[robot_key]                        # HWC uint8 numpy, original resolution
+                for robot_key in ["camera1", "camera2", "camera3"]
+                if robot_key in obs
+            ]
+
+
+
+
+
+
+            heatmaps = extract_attention_heatmaps(
+                raw_camera_frames=raw_frames,
+                attn_buffer=attn_snapshot,
+            )
+
+            # heatmaps = extract_attention_heatmaps(
+            #     raw_camera_frames=raw_frames,
+            #     attn_buffer=attn_snapshot,
+            #     prefix_attn_buffer=getattr(policy.model, "last_prefix_attn_buffer_snapshot", None),
+            # )
+
+
+
+
+
+
+            if heatmaps is not None:
+                composite = np.concatenate(heatmaps, axis=1)          # [H, W*3, 3] BGR
+                viz_frames.append(cv2.cvtColor(composite, cv2.COLOR_BGR2RGB))  # imageio wants RGB
+
+
+
+
+
 
         # must convert it to "action_processed_policy" via make_robot_action using dataset as well
         """
@@ -592,10 +632,10 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
 
         # check if at rest position every n seconds
         # buffer after minimum seconds so dont end the moment loop starts:
-        if timestamp > 20.0 and timestamp % 20.0 < 1.0:
+        if timestamp > 20.0 and timestamp % 100.0 < 1.0:
             if check_at_rest_position(obs):
                 logging.info("At resting position...")
-                # break
+                break
 
 
         # exit()
@@ -763,6 +803,17 @@ def main():
         plt.ioff()
         plt.savefig(f"{'inference_timing_plots' + '/' + TIMING_PLOT_NAME}.png")
         plt.close()
+
+        print("closing plot")
+
+        if viz_frames:
+            video_path = f"attention_videos/attn_vis_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+            imageio.mimwrite(video_path, viz_frames, fps=FPS, codec="libx264")
+            logging.info(f"Saved attention visualization to {video_path}")
+        else:
+            print("did not make video, viz_frames DNE")
+
+
 
         # read curr pos:
         current_obs = robot.get_observation()
