@@ -1,4 +1,4 @@
-# isolated inference.py
+# isolated inference.py (stripped lerobot inference script)
 
 
 """
@@ -40,7 +40,7 @@ from torch.profiler import profile, ProfilerActivity, record_function, tensorboa
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.factory import make_policy, make_pre_post_processors # runs entire config for each model???
 from lerobot.policies.utils import make_robot_action
 from lerobot.processor import (
     make_default_processors,
@@ -54,9 +54,23 @@ from lerobot.utils.utils import get_safe_torch_device, init_logging
 
 from pathlib import Path
 
+# for csv logging action chunks
+import csv
+import sys
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
 
 # use for attn visualziation at end of inference
 viz_frames = []
+
+
+
+
+
+
+
 
 
 # ─────────────────────────────────────────────
@@ -67,26 +81,29 @@ TODO: nickname dict for models would be useful
 """
 
 # model things
-POLICY_PATH  = "grahamwichhh/pi05_v5-pick-up-cube_26k"
-DATASET_PATH = "grahamwichhh/v5_pick-up-cube"   # training dataset, ONLY needed for feature shapes + norm stats
+HF_USER = "grahamwichhh"
+MODEL_PATH = "pi05_v7_l04_30k"
+POLICY_PATH = HF_USER + "/" + MODEL_PATH
+DATASET_PATH = "grahamwichhh/v7_pick-up-cube"   # training dataset, ONLY needed for feature shapes + norm stats
 # NOTE (more info on why we need the dataset):
 #   its extremely annoying but i guess metadata about joint angles/raw uint8 images -> whatever shape they need
 #   to be for the model is stored in lerobots dataset object
 
-TASK         = "Grasp the cube."              # natural language prompt passed to the VLA model
-DEVICE       = "cuda"                       # "cuda", "mps", or "cpu"
-FPS          = 30                           # control loop frequency
-RUN_TIME_S   = 120                          # how long to run inference (seconds)
+TASK         = "pick up the cube."
+DEVICE       = "cuda" # "cuda", "mps", "cpu"
+FPS          = 30 # control loop frequency
+RUN_TIME_S   = 120 #150 # NOTE: pi05 adds 20-25 seconds?
 
 
 # camera ports senmt to OpenCVCameraConfig require Path objects:
 CAMERA_VIDEO_1 = Path("/dev/video0") # front view
 CAMERA_VIDEO_2 = Path("/dev/video2") # 45 degree side view
 CAMERA_VIDEO_3 = Path("/dev/video4") # wrist cam
+CAMERA_VIDEO_4 = Path("/dev/video6") # wrist cam
 
 ROBOT_CONFIG = so_follower.SO101FollowerConfig(
     port="/dev/ttyACM0",
-    id="rocky",                                          # must match th ASDDSAe id used during calibration
+    id="rocky",                                          # must match the id used during calibration
     calibration_dir=Path("~/.cache/huggingface/lerobot/calibration/robots/so_follower").expanduser(),
     cameras={
         "camera1": OpenCVCameraConfig(
@@ -107,20 +124,29 @@ ROBOT_CONFIG = so_follower.SO101FollowerConfig(
             height=480,
             fps=30,
         ),
+        "camera4": OpenCVCameraConfig(
+            index_or_path=CAMERA_VIDEO_4,
+            width=640,
+            height=480,
+            fps=30,
+        ),
     },
 )
 
 
+# Single run-level timestamp for all output naming schemes
+RUN_TIMESTAMP = time.strftime('%Y%m%d_%H%M%S')
+
 
 # things for timing plots:
 # TODO: better naming scheme than "testing_" ... place after model name and send that to plot name?
-TIMING_PLOT_NAME = f"testing_{time.strftime('%Y%m%d_%H%M%S')}"
+TIMING_PLOT_NAME = f"{MODEL_PATH}_{RUN_TIMESTAMP}"
 timing_history = {
     "camera_capture": [],
     "obs_processing": [],
     "predict_action": [],
 }
-plt.ion()  # interactive mode — allows non-blocking updates
+plt.ion()  # interactive mode - allows non-blocking updates
 fig, ax = plt.subplots()
 ax.set_xlabel("iteration")
 ax.set_ylabel("ms")
@@ -154,7 +180,8 @@ if USING_XVLA:
 
 # optims NOTE: not deterministically better
 USE_AUTOCAST = False
-USE_AMP = False  # automatic mixed precision — can reduce latency, may cause instability on some models
+USE_AMP = False  # automatic mixed precision - can reduce latency, may cause instability on some models
+
 
 
 
@@ -162,7 +189,149 @@ USE_AMP = False  # automatic mixed precision — can reduce latency, may cause i
 
 
 # ─────────────────────────────────────────────
-# 0.5. HELPER FUNCTIONS
+# 0.4. CSV ACTION CHUNK / TIMESTEP LOGGING
+# ─────────────────────────────────────────────
+LOG_CHUNKS = True
+CHUNK_LOG_PATH = Path("benchmark_recordings") / f"{MODEL_PATH}_chunks_{RUN_TIMESTAMP}.csv"
+CHUNK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# header is written lazily on first row since action dim is only known at runtime
+_chunk_log_header_written = False
+_chunk_log_file = None
+_chunk_log_writer = None
+
+def init_chunk_logger(action_dim: int, state_dim: int):
+    """
+        Initialize chunk logging on first use (meant to run once per inference call)
+
+        This function is intentionally lazy because the action and state vector
+        sizes are not known until inference is running. When logging is enabled and
+        the CSV has not already been initialized, it:
+
+        1. Opens the chunk log file for writing.
+        2. Creates a CSV writer.
+        3. Writes a header row with:
+             - iteration metadata: iteration index, timestamp, and wall time
+             - one column per state dimension
+             - one column per action dimension
+             - one column per action delta dimension, comparing against the previous
+                 logged action
+             - the overall action delta norm
+
+        Subsequent calls return immediately once the header has been written.
+    """
+    global _chunk_log_file, _chunk_log_writer, _chunk_log_header_written
+    if not LOG_CHUNKS or _chunk_log_header_written:
+        return
+    _chunk_log_file = open(CHUNK_LOG_PATH, "w", newline="")
+    _chunk_log_writer = csv.writer(_chunk_log_file)
+    header = (
+        ["iteration", "timestamp_s", "wall_time"]
+        + [f"state_{i}" for i in range(state_dim)]
+        + [f"action_{i}" for i in range(action_dim)]
+        # per-step deltas vs the immediately preceding logged action, to spot
+        # discontinuities at chunk boundaries / replanning moments
+        + [f"action_delta_{i}" for i in range(action_dim)]
+        + ["action_delta_norm"]
+    )
+    _chunk_log_writer.writerow(header)
+    _chunk_log_header_written = True
+
+
+
+
+def log_chunk_row(iteration, timestamp, state_vec, action_vec, prev_action_vec):
+    """
+    Append a single row to the chunk log CSV.
+
+    This function records the current iteration, the inference timestamp, the
+    wall-clock time, the state vector, the predicted action vector, and the
+    change in action relative to the previously logged action. The action delta
+    is useful for spotting discontinuities when a new chunk starts or when the
+    policy replans. The norm of that delta is also stored as a compact summary
+    of how large the change was.
+
+    If no previous action is available, the delta fields are written as zeros.
+    
+    """
+    if not LOG_CHUNKS or _chunk_log_writer is None:
+        return
+    action_vec = np.asarray(action_vec, dtype=np.float64).reshape(-1)
+    state_vec = np.asarray(state_vec, dtype=np.float64).reshape(-1)
+    if prev_action_vec is None:
+        delta = np.zeros_like(action_vec)
+        delta_norm = 0.0
+    else:
+        prev_action_vec = np.asarray(prev_action_vec, dtype=np.float64).reshape(-1)
+        delta = action_vec - prev_action_vec
+        delta_norm = float(np.linalg.norm(delta))
+    row = (
+        [iteration, f"{timestamp:.4f}", time.strftime("%H:%M:%S")]
+        + list(state_vec)
+        + list(action_vec)
+        + list(delta)
+        + [delta_norm]
+    )
+    _chunk_log_writer.writerow(row)
+    _chunk_log_file.flush()  # flush every row
+
+
+
+def close_chunk_logger():
+    global _chunk_log_file
+    if _chunk_log_file is not None:
+        _chunk_log_file.close()
+        _chunk_log_file = None
+
+
+
+
+
+def plot_csv(csv_path):
+    df = pd.read_csv(csv_path)
+
+    action_cols = [c for c in df.columns if c.startswith("action_") and "delta" not in c]
+    state_cols = [c for c in df.columns if c.startswith("state_")]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    # 1. delta norm - the spike-finder. this is the first thing to look at
+    axes[0].plot(df["timestamp_s"], df["action_delta_norm"], color="crimson")
+    axes[0].set_ylabel("VLA_ACTION_OUTPUT[t] - VLA_ACTION_OUTPUT[t-1]")
+    axes[0].set_title("per-step action discontinuity")
+    axes[0].grid(alpha=0.3)
+
+    # 2. raw predicted actions, one line per dim
+    for c in action_cols:
+        axes[1].plot(df["timestamp_s"], df[c], label=c, alpha=0.8)
+    axes[1].set_ylabel("VLA_ACTION_OUTPUT")
+    axes[1].legend(fontsize=7, ncol=3, loc="upper right")
+    axes[1].grid(alpha=0.3)
+
+    # 3. raw state (what the model thinks the arm is doing)
+    for c in state_cols:
+        axes[2].plot(df["timestamp_s"], df[c], label=c, alpha=0.8)
+    axes[2].set_ylabel("robot reported state")
+    axes[2].set_xlabel("timestamp_s")
+    axes[2].legend(fontsize=7, ncol=3, loc="upper right")
+    axes[2].grid(alpha=0.3)
+
+    plt.tight_layout()
+
+    out_path = csv_path.rsplit(".", 1)[0] + "_plot.png"
+    plt.savefig(out_path, dpi=150)
+    print(f"Saved plot to {out_path}")
+
+    # also print the top 10 spikes with their iteration/timestamp so you can
+    # jump straight to those frames in the saved viz_frames mp4
+    top_spikes = df.nlargest(10, "action_delta_norm")[["iteration", "timestamp_s", "action_delta_norm"]]
+    print("\nTop 10 action discontinuities (cross-reference iteration against your saved video frame number):")
+    print(top_spikes.to_string(index=False))
+
+
+
+# ─────────────────────────────────────────────
+# 0.5. GENERAL HELPER FUNCTIONS
 # ─────────────────────────────────────────────
 
 # defined helper function to end loop early if at rest position
@@ -192,7 +361,6 @@ def check_at_rest_position(obs, threshold=10.0):
 # test loading dataset here:
 def load_dataset(dataset_path: str, rename_map=None):
 
-    print(rename_map)
 
     logging.info(f"Loading dataset metadata from: {dataset_path}")
     # dataset = LeRobotDataset.create(repo_id=dataset_path, robot_type=ROBOT_NAME, fps=FPS, features=dataset_features)
@@ -251,7 +419,7 @@ def load_model(policy_path: str, device: str, ds_meta):
     the dataset the policy was trained on.
 
 
-    ds_meta comes from load_dataset_meta() — it must be the dataset the policy
+    ds_meta comes from load_dataset_meta() - it must be the dataset the policy
     was trained on, not an arbitrary dataset.
     """
     logging.info(f"Loading policy from: {policy_path}")
@@ -265,19 +433,20 @@ def load_model(policy_path: str, device: str, ds_meta):
     policy_cfg.device = device
 
 
+    # # 
+    # from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    # policy_cfg.rtc_config = RTCConfig()  # or with custom params
+
+
     # "Missing key(s) in state_dict" weight loading errors seen with ds_meta=None,
     # because make_policy uses ds_meta.features to correctly configure the model
     # head dimensions before loading weights.
 
     policy = make_policy(policy_cfg, ds_meta=ds_meta)
 
-
     # NOTE: prints layers and torch.Sizes but states many are empty
     # for name, param in policy.named_parameters():
     #     print(name, param.shape)
-
-
-
 
     # for name, module in policy.named_modules():
     #     if isinstance(module, type(module)) and not list(module.parameters(recurse=False)):
@@ -303,8 +472,6 @@ def load_model(policy_path: str, device: str, ds_meta):
 
 
 
-
-
     # ATTEMPTED OPTIMS
 
     # halve weights to fp16:
@@ -312,14 +479,11 @@ def load_model(policy_path: str, device: str, ds_meta):
 
     # policy = torch.compile(policy, mode="reduce-overhead")
     # mode options:
-    #   "default"         — balanced
-    #   "reduce-overhead" — best for repeated same-shape inputs (your case)
-    #   "max-autotune"    — slowest to compile, fastest at runtime
+    #   "default"         - balanced
+    #   "reduce-overhead" - best for repeated same-shape inputs (your case)
+    #   "max-autotune"    - slowest to compile, fastest at runtime
 
     policy_cfg.use_amp = USE_AMP
-
-
-
 
     logging.info("Policy loaded successfully.")
     return policy, policy_cfg
@@ -371,7 +535,7 @@ def load_pipeline(policy_cfg, ds_meta, rename_map=None):
 
 
 # ─────────────────────────────────────────────
-# 4. INFERENCE LOOP
+# 4. INFERENCE
 # ─────────────────────────────────────────────
 def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, fps, run_time_s, dataset):
 
@@ -380,6 +544,10 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
     policy.reset()
     preprocessor.reset()
     postprocessor.reset()
+
+    # used for csv-related
+    iteration = 0
+    prev_action_for_log = None
 
 
     # TODO: this is redundant with renaming in load_dataset()
@@ -416,6 +584,11 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
 
 
 
+
+    # ─────────────────────────────────────────────
+    # LIVE INFERENCE LOOP
+    # ─────────────────────────────────────────────
+
     while timestamp < run_time_s:
         loop_start_t = time.perf_counter()
 
@@ -430,29 +603,28 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
         t2 = time.perf_counter() # check how long observation processing took
 
 
-        # Build the observation batch directly from policy_cfg.input_features.
-        # This bypasses build_dataset_frame entirely — we don't need dataset
-        # storage format, we just need the tensors the model expects.
+        # bypass build_dataset_frame (dataset issues)
+        #   the observation batch can be tensors directly from policy_cfg.input_features.
         observation_frame = {}
 
 
 
-        # Joint state — robot outputs short keys like 'shoulder_pan.pos',
+        # joint state: robot outputs short keys like 'shoulder_pan.pos',
         # policy expects them aggregated under 'observation.state'
         state_keys = [
             "shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
             "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"
         ]
 
-        # TODO: purpose? use for triton?
-        # observation_frame["observation.state"] = state_tensor.to(device) 
+        
+        # observation_frame["observation.state"] = state_tensor.to(device) # TODO: purpose? use for triton?
 
         # state_tensor = torch.tensor(
         #     [obs[k] for k in state_keys], dtype=torch.float32
-        # ).unsqueeze(0)  # shape: (1, 6) — batch dim required
+        # ).unsqueeze(0)  # shape: (1, 6) - batch dim required
 
 
-        # Camera images — just remap the key, no conversion needed.
+        # Camera images - just remap the key, no conversion needed.
         # predict_action calls prepare_observation_for_inference internally,
         # which converts numpy arrays to tensors itself.
         for robot_key, policy_key in robot_to_policy_key_map.items():
@@ -464,7 +636,7 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
             #     buf.copy_(torch.from_numpy(img_np))               # CPU pinned, one copy
             #     img_gpu = buf.cuda(non_blocking=True)             # async DMA, no bounce buffer
             #     img_gpu = img_gpu.permute(2,0,1).float().div_(255.0).unsqueeze(0)
-            #     # (1, 3, H, W) float32 on GPU — preprocessor will skip re-transfer
+            #     # (1, 3, H, W) float32 on GPU - preprocessor will skip re-transfer
             #     observation_frame[policy_key] = img_gpu
 
 
@@ -472,7 +644,7 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
                 observation_frame[policy_key] = obs[robot_key]  # raw numpy array, HWC uint8
 
         
-        # Joint state — same, just pass the numpy array
+        # Joint state - same, just pass the numpy array
         observation_frame["observation.state"] = np.array(
             [obs[k] for k in state_keys], dtype=np.float32
         )
@@ -506,85 +678,108 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
         t3 = time.perf_counter() # check how long it takes to prediction the action
 
 
+        # csv-related: log current action and state and delta from previous
+        if LOG_CHUNKS:
+            action_np = action_values.detach().float().cpu().numpy().reshape(-1) # reminder numpy doesnt support float16 so must cast to .float() TODO: change origin point in model
+            state_np = observation_frame["observation.state"]
+            init_chunk_logger(action_dim=action_np.shape[0], state_dim=state_np.shape[0])
+            log_chunk_row(
+                iteration=iteration,
+                timestamp=timestamp,
+                state_vec=state_np,
+                action_vec=action_np,
+                prev_action_vec=prev_action_for_log,
+            )
+            prev_action_for_log = action_np
+
 
 
 
         # extract_attention_heatmaps lives in modeling_pi05 and reads the buffer
         # snapshot that sample_actions stored on the model after the denoising loop.
         # We pass the raw camera frames from obs so the overlay is on original resolution.
-        from lerobot.policies.pi05.modeling_pi05 import extract_attention_heatmaps
+        # TODO: heatmaps toggle!!
+        # from lerobot.policies.pi05.modeling_pi05 import extract_attention_heatmaps
 
-        attn_snapshot = getattr(policy.model, "last_attn_buffer_snapshot", None)
-        if attn_snapshot:
-            # Build raw_camera_frames list in the same order as the model's camera keys
-            raw_frames = [
-                obs[robot_key]                        # HWC uint8 numpy, original resolution
-                for robot_key in ["camera1", "camera2", "camera3"]
-                if robot_key in obs
-            ]
+        # attn_snapshot = getattr(policy.model, "last_attn_buffer_snapshot", None)
+        # if attn_snapshot:
+        #     # Build raw_camera_frames list in the same order as the model's camera keys
+        #     raw_frames = [
+        #         obs[robot_key]                        # HWC uint8 numpy, original resolution
+        #         for robot_key in ["camera1", "camera2", "camera3"]
+        #         if robot_key in obs
+        #     ]
 
+        #     heatmaps = extract_attention_heatmaps(
+        #         raw_camera_frames=raw_frames,
+        #         attn_buffer=attn_snapshot,
+        #     )
 
+        #     if heatmaps is not None:
+        #         composite = np.concatenate(heatmaps, axis=1)          # [H, W*3, 3] BGR
+        #         viz_frames.append(cv2.cvtColor(composite, cv2.COLOR_BGR2RGB))  # imageio wants RGB
+        #     else:
+        #         # records raw data if no frames recorded
+        #         # TODO: can probably cut down if-else branches
+        #         viz_frames.extend(raw_frames)
+        # else:
+        #     # otherwise save the frames without the heatmap:
 
-
-
-
-            heatmaps = extract_attention_heatmaps(
-                raw_camera_frames=raw_frames,
-                attn_buffer=attn_snapshot,
-            )
-
-            # heatmaps = extract_attention_heatmaps(
-            #     raw_camera_frames=raw_frames,
-            #     attn_buffer=attn_snapshot,
-            #     prefix_attn_buffer=getattr(policy.model, "last_prefix_attn_buffer_snapshot", None),
-            # )
-
-
-
-
-
-
-            if heatmaps is not None:
-                composite = np.concatenate(heatmaps, axis=1)          # [H, W*3, 3] BGR
-                viz_frames.append(cv2.cvtColor(composite, cv2.COLOR_BGR2RGB))  # imageio wants RGB
-
+        raw_frames = [
+            obs[robot_key]                        # HWC uint8 numpy, original resolution
+            for robot_key in ["camera1", "camera2", "camera3"]
+            if robot_key in obs
+        ]
+        if raw_frames:
+            viz_frames.append(np.concatenate(raw_frames, axis=1))
 
 
 
 
 
-        # must convert it to "action_processed_policy" via make_robot_action using dataset as well
-        """
-            should be like: 
-                {'shoulder_pan.pos': 2.354058265686035, 
-                'shoulder_lift.pos': -17.740571975708008, 
-                'elbow_flex.pos': 46.00529479980469, 
-                'wrist_flex.pos': 58.223419189453125, 
-                'wrist_roll.pos': 26.301464080810547, 
-                'gripper.pos': 15.21180248260498}
 
-        """
 
         action_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
-
-        # loop meant to clamp the range of the action sent to the robot to reduce jerky movements
-        # NOTE: this is based off of FPS (tickrates), and the previous action 
-        # if prev_action is not None:
-        #     # loop over current action, determine difference between curr and prev
-        #     for joint, value in action_processed_policy.items():
-        #         delta = value - prev_action[joint]
-        #         clamped_delta = max(-max_delta_deg, min(max_delta_deg, delta)) # 
-        #         # replace value in action_processed_policy
-        #         action_processed_policy[joint] = prev_action[joint] + clamped_delta
-
-        # prev_action = dict(action_processed_policy) # store for next loop iter
 
 
 
         # --- SEND ---
         robot_action_to_send = robot_action_processor((action_processed_policy, obs))
 
+
         robot.send_action(robot_action_to_send)
+
+
+
+
+
+        # debug: print key inference payloads here
+        # print("\n=== RAW OBSERVATION (obs) ===")
+        # print(obs)
+        # print("\n=== PROCESSED OBSERVATION (observation_frame) ===")
+        # print(observation_frame)
+        # print("\n=== ACTION VALUES (model output) ===")
+        # print(action_values)
+        # print("\n=== ACTION DICT / POLICY ACTION ===")
+        # print(action_processed_policy)
+        # if "observation.state" in observation_frame:
+        #     print("\n=== observation.state ===")
+        #     print(observation_frame["observation.state"])
+        # if hasattr(action_values, "shape"):
+        #     print("\n=== action_values.shape ===")
+        #     print(action_values.shape)
+        # if hasattr(action_values, "dtype"):
+        #     print("\n=== action_values.dtype ===")
+        #     print(action_values.dtype)
+        # print("\n=== ROBOT ACTION TO SEND ===")
+        # print(robot_action_to_send)
+        # exit()
+
+
+
+
+
+
 
         # --- PACE TO FPS ---
 
@@ -598,11 +793,6 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
         # if sleep_time_s < 0:
         #     logging.warning(f"Loop running slow: {1/dt_s:.1f} Hz vs target {fps} Hz")
         precise_sleep(max(sleep_time_s, 0.0))
-
-
-
-
-
 
         # matplot:
         timing_history["camera_capture"].append(1000 * (t1 - t0))
@@ -624,19 +814,21 @@ def run_inference(robot, policy, policy_cfg, preprocessor, postprocessor, task, 
             ax.set_xlabel("iteration")
             ax.set_ylabel("ms")
             ax.set_title("per-iteration timing")
-            plt.pause(0.001)  # non-blocking draw — 1ms, won't affect FPS meaningfully
+            plt.pause(0.001)  # non-blocking draw - 1ms, won't affect FPS meaningfully
 
 
         timestamp = time.perf_counter() - start_t
+        # print(timestamp)
         
 
         # check if at rest position every n seconds
         # buffer after minimum seconds so dont end the moment loop starts:
-        if timestamp > 20.0 and timestamp % 100.0 < 1.0:
-            if check_at_rest_position(obs):
-                logging.info("At resting position...")
-                break
+        # if timestamp > 20.0 and timestamp % 100.0 < 1.0:
+        #     if check_at_rest_position(obs):
+        #         logging.info("At resting position...")
+        #         break
 
+        
 
         # exit()
 
@@ -672,6 +864,21 @@ def main():
 
     # Step 3: build normalization pipelines using ds_meta.stats
     preprocessor, postprocessor = load_pipeline(policy_cfg, dataset.meta)
+
+
+
+
+    # ── locate tokenizer for attention-line visualization ──────────────────────
+    # one-time inspection — run once, see what prints, then keep whichever line works
+    # print(preprocessor)
+    # print(type(preprocessor))
+    # if hasattr(preprocessor, "steps"):
+    #     for step in preprocessor.steps:
+    #         print(" -", type(step).__name__, [a for a in dir(step) if "token" in a.lower()])
+
+
+
+
 
 
     # Step 4: connect robot and run
@@ -737,6 +944,7 @@ def main():
 
 
             # torch profiling NOTE: sometimes does not actually run inference when compiling cuda graphs? TODO: check
+            # usage: uncomment, after saved run [tensorboard --logdir=./torch_profiling/profiler/]
 
             # from torch.profiler import profile, ProfilerActivity, record_function, tensorboard_trace_handler
             # with profile(
@@ -757,7 +965,6 @@ def main():
             #         dataset=dataset
             #     )
             # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-            
             # prof.export_chrome_trace("trace.json")
 
 
@@ -806,14 +1013,6 @@ def main():
 
         print("closing plot")
 
-        if viz_frames:
-            video_path = f"attention_videos/attn_vis_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
-            imageio.mimwrite(video_path, viz_frames, fps=FPS, codec="libx264")
-            logging.info(f"Saved attention visualization to {video_path}")
-        else:
-            print("did not make video, viz_frames DNE")
-
-
 
         # read curr pos:
         current_obs = robot.get_observation()
@@ -836,9 +1035,32 @@ def main():
             robot.send_action(interpolated)
             precise_sleep(1.0 / FPS)
 
-        # Always disconnect cleanly even if an exception is raised mid-loop
+
+        # heatmap visualization occurs last (sometimes heatmap saving skips resting pos action)
+        if viz_frames:
+            video_path = f"benchmark_recordings/{MODEL_PATH}_{RUN_TIMESTAMP}.mp4"
+            imageio.mimwrite(video_path, viz_frames, fps=FPS, codec="libx264")
+            logging.info(f"Saved visualization to {video_path}")
+        else:
+            print("did not make video, viz_frames DNE")
+
+        # unfortunately these need to be done before trying to disconnect the robot since it will
+        #   occassionally error (perms error?)
+        # TODO: investigate "RuntimeError: Failed to write 'Torque_Enable' on id_=6 with '0' after 6 tries. [RxPacketError] Overload error!"
+
+        logging.info("Done.") # end logging 
+
+        close_chunk_logger() # close csv
+        plot_csv(str(CHUNK_LOG_PATH)) # auto plot the csv (must be string, uses rsplit)
+
+
+
+
         robot.disconnect()
-        logging.info("Done.")
+
+
+
+
 
 
 

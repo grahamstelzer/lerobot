@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F  # noqa: N812   
 from torch import Tensor, nn
 from typing_extensions import Unpack
 
@@ -31,7 +31,11 @@ from lerobot.utils.import_utils import _transformers_available
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
-    from transformers.models.gemma import modeling_gemma
+
+
+    from transformers.models.gemma import modeling_gemma # eager attention function and apply_rotary_pos_emb are imported from here
+
+
     from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
     from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
@@ -50,6 +54,550 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+
+
+
+# debug printouts:
+DEBUG = False  # Set to False for production
+
+def debug_print(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+
+
+
+
+# ─────────────────────────────────────────────
+# attn visualization utilities:
+# method:
+#   we are trying to save the attention matrices that pertain to the image to image attn
+#   this is a fine-grain task because we are using prefix-lm where pre = img tokens, lang
+#   tokens and the suffix is action tokens that we add noise to
+#
+#   we essentially add labels to enumerate the layers, then pull the tensors and recalculate
+#   attention outside of the gemma models pi05 uses
+# ─────────────────────────────────────────────
+
+# # module level, populated during sample_actions, used in inference script
+# _ATTN_BUFFER: dict[int, torch.Tensor] = {}
+
+# # define layers to look at:
+# _CAPTURE_LAYERS: set[int] = {14, 15, 16, 17}
+# # _CAPTURE_LAYERS: set[int] = set(range(18))  # all 18 layers
+
+# module level buffers, populated during sample_actions, cleared after snapshot
+# suffix buffer: action-token attention, keyed by layer index
+# prefix buffer: prefix self-attention for rollout, keyed by layer index
+_ATTN_BUFFER: dict[int, torch.Tensor] = {}         # suffix pass: [1, 8, 50, 1018]
+_PREFIX_ATTN_BUFFER: dict[int, torch.Tensor] = {}  # prefix pass: [1, 8, 968, 968]
+
+# capture all 18 layers — rollout requires the full chain
+_CAPTURE_LAYERS: set[int] = set(range(18))
+
+
+
+
+
+
+
+
+
+# # wrapper to intercept eager attn calculation, save attention weights, call original function
+# def _patch_eager_attention():
+
+#     if modeling_gemma is None:
+#         return
+
+#     # save original function to call at the end:
+#     original_fn = modeling_gemma.eager_attention_forward
+
+#     def patched(module, query, key, value, attention_mask, scaling, **kwargs):
+#         # NOTE 1: only tagged gemma expert, therefore layers arent looked at
+#         # NOTE 2: query sequence length here is 50 TODO: verify??
+
+#         layer_idx = getattr(module, "_attn_capture_layer_idx", None)
+#         if layer_idx in _CAPTURE_LAYERS and query.shape[-2] == 50:
+#             # must unforutnately recompute attention here
+#             # TODO: faster softmax
+#             # NOTE: Q and K are bfloat16? cast to float32 or quant. artificats in end result TODO: double check
+
+#             with torch.no_grad():
+#                 scores = torch.matmul(
+#                     query.float(),             # [1, 8, 50, head_dim]
+#                     key.float().transpose(-2, -1)  # [1, 8, head_dim, 1018]
+#                 ) * scaling                   # -> [1, 8, 50, 1018]
+
+#                 # add 4d attn masks 
+#                 # TODO: reverify
+#                 if attention_mask is not None:
+#                     scores = scores + attention_mask.float()
+
+#                 weights = torch.softmax(scores, dim=-1)
+
+#             # detach and send to CPU asap:
+#             _ATTN_BUFFER[layer_idx] = weights.detach().cpu()
+
+#         return original_fn(module, query, key, value, attention_mask, scaling, **kwargs)
+
+#     modeling_gemma.eager_attention_forward = patched
+
+
+
+# # call patching at import time:
+# if not getattr(modeling_gemma, "_attn_patched", False) and modeling_gemma is not None:
+#     _patch_eager_attention()
+#     modeling_gemma._attn_patched = True
+
+# wrapper to intercept eager attn, save matrices for rollout, call original unchanged
+def _patch_eager_attention():
+
+    if modeling_gemma is None:
+        return
+
+    original_fn = modeling_gemma.eager_attention_forward
+
+    def patched(module, query, key, value, attention_mask, scaling, **kwargs):
+
+        layer_idx = getattr(module, "_attn_capture_layer_idx", None)
+        is_prefix_layer = getattr(module, "_attn_prefix_layer_idx", None)
+
+        # ── SUFFIX PASS CAPTURE ───────────────────────────────────────────────
+        # Fires when gemma_expert processes the 50 action tokens.
+        # query.shape[-2] == 50 confirms this is the action-token pass, not
+        # the prefix pass where query length would be 968.
+        # layer_idx is only set on gemma_expert layers (tagged in __init__).
+        if layer_idx in _CAPTURE_LAYERS and query.shape[-2] == 50:
+            with torch.no_grad():
+                scores = torch.matmul(
+                    query.float(),                     # [1, 8, 50, head_dim]
+                    key.float().transpose(-2, -1)      # [1, 8, head_dim, 1018]
+                ) * scaling                            # → [1, 8, 50, 1018]
+                if attention_mask is not None:
+                    scores = scores + attention_mask.float()
+                weights = torch.softmax(scores, dim=-1)  # [1, 8, 50, 1018]
+            _ATTN_BUFFER[layer_idx] = weights.detach().cpu()
+
+        # ── PREFIX PASS CAPTURE ───────────────────────────────────────────────
+        # Fires when paligemma processes the 968 prefix tokens (images + lang).
+        # is_prefix_layer is only set on paligemma language model layers.
+        # query.shape[-2] == 968 confirms this is the full prefix self-attention.
+        # These square [968, 968] matrices are what rollout requires.
+        elif is_prefix_layer in _CAPTURE_LAYERS and query.shape[-2] == 968:
+            with torch.no_grad():
+                scores = torch.matmul(
+                    query.float(),                     # [1, 8, 968, head_dim]
+                    key.float().transpose(-2, -1)      # [1, 8, head_dim, 968]
+                ) * scaling                            # → [1, 8, 968, 968]
+                if attention_mask is not None:
+                    scores = scores + attention_mask.float()
+                weights = torch.softmax(scores, dim=-1)  # [1, 8, 968, 968]
+            _PREFIX_ATTN_BUFFER[is_prefix_layer] = weights.detach().cpu()
+
+        return original_fn(module, query, key, value, attention_mask, scaling, **kwargs)
+
+    modeling_gemma.eager_attention_forward = patched
+
+
+if not getattr(modeling_gemma, "_attn_patched", False) and modeling_gemma is not None:
+    _patch_eager_attention()
+    modeling_gemma._attn_patched = True
+
+
+
+
+
+
+
+# ─────────────────────────────────────────────
+# heatmap extraction:
+# NOTE: we are accounting for:
+#   1. siglip 224x224
+#   2. 18 layers
+#   3. 50 time steps
+#   4. denoising methodology
+#   5. prefix-lm methodology
+#   6. cam images embedded within the whole input tensor
+# ─────────────────────────────────────────────
+
+
+# def extract_attention_heatmaps(
+#     raw_camera_frames: list,
+#     attn_buffer: dict[int, torch.Tensor] | None = None,
+#     tokens_per_cam: int = 256,
+#     patch_grid: int = 16,
+# ) -> list | None:
+#     """
+#     Converts the attention weights stored in _ATTN_BUFFER into per-camera
+#     heatmap overlays on the original camera frames.
+
+#     Must be called after sample_actions completes (buffer is populated) and
+#     before _ATTN_BUFFER.clear() is called.
+
+#     Args:
+#         raw_camera_frames:
+#             List of 3 numpy arrays, each shape [H, W, 3] uint8, in RGB order.
+#             These are the ORIGINAL camera frames at their native resolution
+#             (e.g. 480x640), not the 224x224 model inputs. The heatmap will be
+#             upsampled to match whatever resolution these frames are.
+
+#         tokens_per_cam:
+#             Number of patch tokens per camera. 256 = 16x16 patches, confirmed
+#             by trace L29: per_cam=256. Derived from image_size=224, patch_size=14.
+
+#         patch_grid:
+#             Square root of tokens_per_cam. 16x16=256. Used to reshape the flat
+#             token sequence back into a spatial grid before upsampling.
+
+#     Returns:
+#         List of 3 numpy arrays, each [H, W, 3] uint8 BGR, ready for cv2 display
+#         or concatenation into a video frame.
+#         Returns None if _ATTN_BUFFER is empty (capture did not fire).
+#     """
+#     import numpy as np
+#     import cv2
+
+
+#     # patch function should only fire in inference 
+#     buffer = attn_buffer if attn_buffer is not None else _ATTN_BUFFER
+
+#     if not buffer:
+#         logging.warning("extract_attention_heatmaps: buffer is empty, skipping.")
+#         return None
+
+
+
+#     # ── STEP 1: COLLECT AND AVERAGE ACROSS LAYERS ────────────────────────────
+#     # Pull tensors for each capture layer in order. Each is [1, 8, 50, 1018].
+#     # Stack along a new leading dimension then mean-reduce it, giving us one
+#     # averaged tensor across the 4 layers: [1, 8, 50, 1018].
+#     #
+#     # We sort the keys so layer order is deterministic regardless of dict
+#     # insertion order (Python 3.7+ dicts are ordered but explicit is safer).
+#     layer_tensors = [
+#         buffer[i]
+#         for i in sorted(_CAPTURE_LAYERS)
+#         if i in buffer
+#     ]
+
+#     if not layer_tensors:
+#         logging.warning("extract_attention_heatmaps: no capture layers found in buffer.")
+#         return None
+
+#     # stacked: [4, 1, 8, 50, 1018]
+#     stacked = torch.stack(layer_tensors, dim=0)
+#     # mean over the 4 layers -> [1, 8, 50, 1018]
+#     averaged_layers = stacked.mean(dim=0)
+
+#     # ── STEP 2: AVERAGE ACROSS 8 ATTENTION HEADS ─────────────────────────────
+#     # Each head has learned different attention patterns. Averaging collapses
+#     # them into a single consensus view. This loses per-head information but
+#     # gives a clean single heatmap per camera.
+#     # [1, 8, 50, 1018] -> [1, 50, 1018]
+#     averaged_heads = averaged_layers.mean(dim=1)
+
+#     # ── STEP 3: DROP BATCH DIM AND AVERAGE OVER ACTION TIMESTEPS ─────────────
+#     # squeeze(0): [1, 50, 1018] -> [50, 1018]
+#     # Each of the 50 rows is one action timestep attending over 1018 keys.
+#     # Averaging over timesteps gives one weight per key position representing
+#     # the overall attention across the whole predicted action chunk.
+#     # [50, 1018] -> [1018]
+#     per_key = averaged_heads.squeeze(0).mean(dim=0)
+
+#     # ── STEP 4: SLICE PER CAMERA AND BUILD HEATMAP ───────────────────────────
+#     # Key sequence layout (confirmed trace L29):
+#     #   cam1: positions   0 - 255   (256 tokens)
+#     #   cam2: positions 256 - 511   (256 tokens)
+#     #   cam3: positions 512 - 767   (256 tokens)
+#     #   lang: positions 768 - 967   (200 tokens) - not used here
+#     #   action: positions 968-1017  (50 tokens)  - not used here
+#     #
+#     # We only process the image portion (first tokens_per_cam * n_cams values).
+#     heatmaps = []
+
+#     for cam_idx, frame in enumerate(raw_camera_frames):
+
+#         # Slice the 256 attention weights belonging to this camera
+#         start = cam_idx * tokens_per_cam          # 0, 256, 512
+#         end   = start + tokens_per_cam            # 256, 512, 768
+#         cam_weights = per_key[start:end]          # [256] - one weight per patch
+
+#         # ── STEP 5: RESHAPE TO SPATIAL GRID ──────────────────────────────────
+#         # The 256 patch tokens are laid out in raster order (left-to-right,
+#         # top-to-bottom) matching the original image grid. Reshape restores
+#         # the 2D spatial structure so interpolation is spatially coherent.
+#         # [256] -> [16, 16]
+#         grid = cam_weights.reshape(patch_grid, patch_grid).float()
+
+#         # ── STEP 6: NORMALIZE TO [0, 1] ──────────────────────────────────────
+#         # Attention weights after softmax already sum to 1 across keys, but
+#         # the absolute values are small and uneven across cameras. Per-camera
+#         # normalization ensures the full colormap range is used for each view.
+#         grid_min = grid.min()
+#         grid_max = grid.max()
+#         grid = (grid - grid_min) / (grid_max - grid_min + 1e-8)
+
+#         # ── STEP 7: UPSAMPLE TO ORIGINAL FRAME RESOLUTION ────────────────────
+#         # frame is [H, W, 3] - read H and W from the actual frame passed in.
+#         # We do NOT hardcode 480x640 here so the function works with any camera.
+#         #
+#         # F.interpolate requires [N, C, H, W]. We add two dims, interpolate,
+#         # then remove them to get back to [H, W].
+#         H, W = frame.shape[:2]
+#         grid_upsampled = F.interpolate(
+#             grid.unsqueeze(0).unsqueeze(0),  # [1, 1, 16, 16]
+#             size=(H, W),
+#             mode="bilinear",
+#             align_corners=False,
+#         ).squeeze().numpy()                  # [H, W]
+
+#         # ── STEP 8: CONVERT TO COLORMAP ──────────────────────────────────────
+#         # Scale [0,1] float -> [0,255] uint8, then apply JET colormap.
+#         # JET: blue=low attention, green=medium, red=high attention.
+#         # Output: [H, W, 3] BGR (cv2 native format).
+#         heatmap_uint8 = (grid_upsampled * 255).astype(np.uint8)
+#         heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+#         # ── STEP 9: ALPHA BLEND ONTO ORIGINAL FRAME ──────────────────────────
+#         # frame arrives as RGB uint8. cv2 works in BGR, so convert first.
+#         # addWeighted: output = 0.55*original + 0.45*heatmap
+#         # Weights are a tunable tradeoff - adjust to taste.
+#         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+#         overlay = cv2.addWeighted(frame_bgr, 0.55, heatmap_color, 0.45, 0)
+
+#         heatmaps.append(overlay)  # [H, W, 3] BGR uint8
+
+#     return heatmaps  # list of 3 x [H, W, 3] BGR uint8
+
+
+
+
+
+def _compute_rollout(prefix_attn_buffer: dict[int, torch.Tensor], seq_len: int = 968) -> torch.Tensor:
+    """
+    Computes attention rollout over the prefix self-attention matrices.
+
+    Rollout (Abnar & Zuidema 2020) propagates attention backwards through
+    all transformer layers by multiplying layer attention matrices together
+    with an identity residual at each step. This accounts for the fact that
+    each layer's attention operates on representations already mixed by all
+    previous layers — raw attention weights from a single layer only tell
+    you what that layer attended to, not what original input tokens were
+    most influential.
+
+    Args:
+        prefix_attn_buffer:
+            Dict from layer_idx -> [1, 8, 968, 968] tensor.
+            Must contain all 18 layers (0..17) for a complete rollout.
+            If layers are missing the rollout degrades gracefully — missing
+            layers are treated as identity (no mixing at that layer).
+
+        seq_len:
+            Number of prefix tokens. 968 confirmed by trace L29.
+
+    Returns:
+        rollout: [968, 968] float32 tensor.
+        rollout[i, j] = how much token i's final representation depends on
+        token j's original input embedding, integrated across all layers.
+    """
+    # Start from identity — before any layers, each token only depends on itself
+    rollout = torch.eye(seq_len, dtype=torch.float32)  # [968, 968]
+
+    for layer_idx in range(18):
+        if layer_idx not in prefix_attn_buffer:
+            # missing layer — treat as identity, skip
+            continue
+
+        # A: [1, 8, 968, 968] → mean over 8 heads → [968, 968]
+        A = prefix_attn_buffer[layer_idx].squeeze(0).mean(dim=0).float()
+
+        # Add identity residual to account for skip connections.
+        # Without this, rollout underestimates how much each token attends
+        # to itself through the residual stream.
+        A = A + torch.eye(seq_len, dtype=torch.float32)
+
+        # Renormalize rows so each row still sums to 1.
+        # Required after adding identity — without renormalization the
+        # values grow unboundedly across layers.
+        A = A / (A.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Propagate: combine this layer's mixing with all previous layers.
+        # Matrix multiply: for each token i, its new rollout vector is a
+        # weighted combination of the rollout vectors of all tokens it
+        # attended to at this layer.
+        rollout = torch.matmul(A, rollout)  # [968, 968]
+
+    return rollout  # [968, 968]
+
+
+def extract_attention_heatmaps(
+    raw_camera_frames: list,
+    attn_buffer: dict[int, torch.Tensor] | None = None,
+    prefix_attn_buffer: dict[int, torch.Tensor] | None = None,
+    tokens_per_cam: int = 256,
+    patch_grid: int = 16,
+    prefix_seq_len: int = 968,
+) -> list | None:
+    """
+    Converts captured attention weights into per-camera heatmap overlays
+    using attention rollout for improved accuracy.
+
+    Rollout path (used when prefix_attn_buffer is provided):
+        1. Compute rollout over 18 prefix layers → [968, 968]
+           This tells us how much each prefix token's FINAL representation
+           depends on each ORIGINAL input token (image patches, lang tokens).
+        2. Take suffix attn [50, 1018], slice prefix portion [50, 968].
+           This tells us which prefix positions the action tokens attended to.
+        3. Combine: suffix_attn @ rollout → [50, 968]
+           This gives us action-to-original-input influence, accounting for
+           all the mixing that happened inside paligemma's 18 layers.
+        4. Slice per camera, reshape to [16, 16], upsample, colormap, blend.
+
+    Fallback path (used when prefix_attn_buffer is None or incomplete):
+        Falls back to the original layer-average method so the function
+        never silently fails — you get a degraded but valid heatmap.
+
+    Args:
+        raw_camera_frames:
+            List of 3 numpy arrays [H, W, 3] uint8 RGB, original resolution.
+
+        attn_buffer:
+            Suffix pass attention: dict layer_idx -> [1, 8, 50, 1018].
+            If None, reads from module-level _ATTN_BUFFER.
+
+        prefix_attn_buffer:
+            Prefix pass attention for rollout: dict layer_idx -> [1, 8, 968, 968].
+            If None, reads from module-level _PREFIX_ATTN_BUFFER.
+            If empty, falls back to non-rollout method.
+
+        tokens_per_cam: 256. Confirmed trace L29.
+        patch_grid: 16. sqrt(256).
+        prefix_seq_len: 968. Confirmed trace L29.
+    """
+    import numpy as np
+    import cv2
+
+    # resolve buffers — use passed snapshots or fall back to module-level
+    s_buffer = attn_buffer if attn_buffer is not None else _ATTN_BUFFER
+    p_buffer = prefix_attn_buffer if prefix_attn_buffer is not None else _PREFIX_ATTN_BUFFER
+
+    if not s_buffer:
+        logging.warning("extract_attention_heatmaps: suffix buffer empty, skipping.")
+        return None
+
+    # ── STEP 1: BUILD PER-KEY ATTENTION VECTOR [1018] ────────────────────────
+    # Two paths depending on whether rollout data is available.
+
+    use_rollout = len(p_buffer) == 18  # need all 18 layers for valid rollout
+
+    if use_rollout:
+        # ── ROLLOUT PATH ──────────────────────────────────────────────────────
+
+        # 1a. Compute rollout over prefix layers → [968, 968]
+        rollout = _compute_rollout(p_buffer, seq_len=prefix_seq_len)  # [968, 968]
+
+        # 1b. Collect suffix attention across all 18 layers, mean over layers.
+        # Each tensor: [1, 8, 50, 1018]
+        layer_tensors = [
+            s_buffer[i].float()
+            for i in range(18)
+            if i in s_buffer
+        ]
+        if not layer_tensors:
+            logging.warning("extract_attention_heatmaps: no suffix layers in buffer.")
+            return None
+
+        # stacked: [N_layers, 1, 8, 50, 1018] → mean over layers → [1, 8, 50, 1018]
+        suffix_avg = torch.stack(layer_tensors, dim=0).mean(dim=0)
+
+        # 1c. Mean over 8 heads → [1, 50, 1018], drop batch → [50, 1018]
+        suffix_avg = suffix_avg.squeeze(0).mean(dim=0)  # [50, 1018]
+
+        # 1d. Slice the prefix portion of the suffix attention.
+        # Positions 0..967 are the prefix keys (image + language tokens).
+        # Positions 968..1017 are the action keys (self-attention within suffix).
+        # We only want the prefix portion for rollout combination.
+        suffix_to_prefix = suffix_avg[:, :prefix_seq_len]  # [50, 968]
+
+        # 1e. Combine suffix attention with rollout.
+        # suffix_to_prefix[t, p] = how much action timestep t attended to
+        #                           prefix position p's FINAL representation.
+        # rollout[p, q]           = how much prefix position p's final rep
+        #                           depended on original input token q.
+        # product[t, q]           = how much action timestep t depended on
+        #                           original input token q end-to-end.
+        combined = torch.matmul(
+            suffix_to_prefix.float(),  # [50, 968]
+            rollout,                   # [968, 968]
+        )                              # → [50, 968]
+
+        # 1f. Average over 50 action timesteps → [968]
+        per_key = combined.mean(dim=0)  # [968]
+
+    else:
+        # ── FALLBACK PATH (no rollout) ────────────────────────────────────────
+        # Original method: stack last 4 captured layers, mean heads, mean timesteps.
+        logging.warning(
+            f"extract_attention_heatmaps: only {len(p_buffer)}/18 prefix layers "
+            f"captured — falling back to direct attention (no rollout)."
+        )
+        layer_tensors = [
+            s_buffer[i]
+            for i in sorted(s_buffer.keys())
+            if i in s_buffer
+        ]
+        stacked = torch.stack(layer_tensors, dim=0).mean(dim=0)   # [1, 8, 50, 1018]
+        per_key = stacked.squeeze(0).mean(dim=0).mean(dim=0)      # [1018]
+
+    # ── STEP 2: SLICE, RESHAPE, UPSAMPLE, COLORMAP PER CAMERA ────────────────
+    # per_key is [968] in rollout path (prefix only) or [1018] in fallback.
+    # Camera layout is identical in both cases: cam1=[0:256], cam2=[256:512], cam3=[512:768].
+    heatmaps = []
+
+    for cam_idx, frame in enumerate(raw_camera_frames):
+
+        start = cam_idx * tokens_per_cam       # 0, 256, 512
+        end   = start + tokens_per_cam         # 256, 512, 768
+        cam_weights = per_key[start:end]       # [256]
+
+        # reshape flat patch sequence back to spatial grid
+        # raster order confirmed: patches laid out left-to-right, top-to-bottom
+        grid = cam_weights.reshape(patch_grid, patch_grid).float()  # [16, 16]
+
+        # per-camera normalization to [0, 1]
+        # ensures full colormap range is used even if absolute values are small
+        g_min, g_max = grid.min(), grid.max()
+        grid = (grid - g_min) / (g_max - g_min + 1e-8)
+
+        # upsample [16, 16] → [H, W] using bilinear interpolation
+        # this is visualization smoothing only — underlying resolution is 16x16
+        H, W = frame.shape[:2]
+        grid_up = F.interpolate(
+            grid.unsqueeze(0).unsqueeze(0),  # [1, 1, 16, 16]
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze().numpy()                  # [H, W]
+
+        # JET colormap: blue=low, green=medium, red=high attention
+        heatmap_u8 = (grid_up * 255).astype(np.uint8)
+        heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)  # [H, W, 3] BGR
+
+        # alpha blend onto original frame
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        overlay = cv2.addWeighted(frame_bgr, 0.55, heatmap_color, 0.45, 0)
+
+        heatmaps.append(overlay)  # [H, W, 3] BGR uint8
+
+    return heatmaps
+
+
+
+
+
+
+
+
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -99,6 +647,11 @@ def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact 
 
 
 def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (exact copy)
+
+
+    debug_print("PI05: inside make_att_2d_masks, shapes - pad_masks:", pad_masks.shape, "att_masks:", att_masks.shape)
+
+
     """Copied from big_vision.
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
@@ -147,6 +700,12 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     width: int,
     mode: str = "bilinear",
 ) -> torch.Tensor:
+
+
+    debug_print("PI05: inside resize_with_pad_torch, input shape:", images.shape)
+
+
+
     """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
     by padding with black. If the image is float32, it must be in the range [-1, 1].
 
@@ -219,6 +778,11 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
 ):
+
+
+    debug_print("PI05: inside compute_layer_complete, layer_idx:", layer_idx, "inputs_embeds shapes:", [ie.shape for ie in inputs_embeds])
+
+
     models = [paligemma.language_model, gemma_expert.model]
     query_states = []
     key_states = []
@@ -420,6 +984,11 @@ class PaliGemmaWithExpertModel(
                 param.requires_grad = False
 
     def train(self, mode: bool = True):
+
+
+        debug_print("PI05: inside PaliGemmaWithExpertModel.train, mode:", mode)
+
+
         super().train(mode)
         if self.freeze_vision_encoder:
             self.paligemma.vision_tower.eval()
@@ -441,6 +1010,11 @@ class PaliGemmaWithExpertModel(
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
     ):
+
+
+        debug_print("PI05: inside PaliGemmaWithExpertModel.forward, inputs_embeds shapes:", [ie.shape if ie is not None else None for ie in inputs_embeds], "attention_mask shape:", attention_mask.shape if attention_mask is not None else None, "position_ids shape:", position_ids.shape if position_ids is not None else None)
+
+
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
@@ -557,6 +1131,44 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
+
+
+
+
+
+
+
+
+
+        # ───────────────────────────────────────────────────────────────────────────────────────
+        # attn visualization layer tagging (since we only want to see attn of last few heads)
+        # also NOTE: only looking at gemma expert TODO: double check validity
+        # ──────────────────────────────────────────────────────────────────────────────────────
+        for _idx, _layer in enumerate(self.paligemma_with_expert.gemma_expert.model.layers):
+            _layer.self_attn._attn_capture_layer_idx = _idx
+
+
+        # tag gemma_expert layers for suffix pass capture (existing)
+        for _idx, _layer in enumerate(self.paligemma_with_expert.gemma_expert.model.layers):
+            _layer.self_attn._attn_capture_layer_idx = _idx
+
+        # tag paligemma language model layers for prefix pass capture (new)
+        # these are the square [968, 968] attention matrices needed for rollout
+        for _idx, _layer in enumerate(self.paligemma_with_expert.paligemma.language_model.layers):
+            _layer.self_attn._attn_prefix_layer_idx = _idx
+
+
+
+
+
+
+
+
+
+
+
+
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -582,6 +1194,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+
+
+
+
+
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -654,6 +1272,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Process language tokens
         def lang_embed_func(tokens):
+
+
+
+            debug_print("PI05: inside lang_embed_func, tokens shape:", tokens.shape)
+
+
+
             lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
@@ -675,6 +1300,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions, timestep):
+
+
+        debug_print("PI05: inside embed_suffix, noisy_actions shape:", noisy_actions.shape, "timestep shape:", timestep.shape)
+
+
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -722,6 +1352,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+
+
+        debug_print("PI05: inside PI05Pytorch.forward, images shape:", images.shape, "img_masks shape:", img_masks.shape, "tokens shape:", tokens.shape, "masks shape:", masks.shape, "actions shape:", actions.shape, "noise shape:", noise.shape if noise is not None else None, "time shape:", time.shape if time is not None else None)
+
+
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -788,6 +1423,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
+
+
+
+
+
+
+
+
+        debug_print("PI05: inside sample_actions")
+
+        # hook to check attention at layer 17 (last layer) of expert gemma during sampling, should show attention mask shapes and kv cache shapes
+        # def hook_fn(module, input, output):
+        #     debug_print(f"ATTN_DEBUG gemma layer17 output shape: {output[0].shape}")
+        # handle = self.paligemma_with_expert.gemma_expert.model.layers[17].register_forward_hook(hook_fn)
+
+
+        # clear _ATTN_BUFFER
+        _ATTN_BUFFER.clear()
+        
+
+
+
+
+
+
+
+
+
+
+
+
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -804,24 +1470,47 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+
+
+        # after embed_prefix returns:
+        tokens_per_cam = prefix_embs.shape[1] - tokens.shape[1]  # total img tokens
+        debug_print(f"ATTN_DEBUG prefix breakdown: total={prefix_embs.shape[1]}, img={tokens_per_cam}, lang={tokens.shape[1]}, per_cam={tokens_per_cam // len(images)}")
+
+
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+
+
+
+
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+            inputs_embeds=[prefix_embs, None], # !!! this triggers if/else in PaliGemmaWithExpertModel.forward to only run the prefix (968 or so tokens through 18 paligemma layers) through the language model and not the expert
             use_cache=True,
         )
 
+        debug_print(f"ATTN_DEBUG past_key_values: {len(past_key_values)} layers, key shape: {past_key_values[0][0].shape}") # should show batch_size, num_heads, seq_len, head_dim
+
+
+
+
+
         dt = -1.0 / num_steps
 
+        # denosing loop
         x_t = noise
         for step in range(num_steps):
+
+
+            debug_print("PI05: inside sample_actions loop, step:", step, "x_t shape:", x_t.shape)
+
+
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
@@ -854,6 +1543,50 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+
+
+
+
+
+
+
+
+
+
+
+
+        # created in hook above
+        # handle.remove()
+
+        # ── ATTENTION HEATMAP CAPTURE ─────────────────────────────────────────
+        # _ATTN_BUFFER was populated by the patch during the denoising loop.
+        # We capture heatmaps from the LAST denoising step's buffer state.
+        # raw_camera_frames is not available here - we store raw buffer output
+        # on self and let the inference script call extract_attention_heatmaps
+        # with the actual camera frames it already has.
+        # Buffer is cleared here so stale data never bleeds into the next call.
+
+        # self.last_attn_buffer_snapshot = {k: v.clone() for k, v in _ATTN_BUFFER.items()}
+        # _ATTN_BUFFER.clear()
+
+        # snapshot both buffers before clearing — inference script only needs the
+        # heatmaps but extract_attention_heatmaps reads both internally
+        self.last_attn_buffer_snapshot = {k: v.clone() for k, v in _ATTN_BUFFER.items()}
+        self.last_prefix_attn_buffer_snapshot = {k: v.clone() for k, v in _PREFIX_ATTN_BUFFER.items()}
+        _ATTN_BUFFER.clear()
+        _PREFIX_ATTN_BUFFER.clear()
+
+
+
+
+
+
+
+
+
+
+
+
         return x_t
 
     def denoise_step(
@@ -863,8 +1596,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t,
         timestep,
     ):
+
+
+        debug_print("PI05: inside denoise_step, x_t shape:", x_t.shape, "timestep shape:", timestep.shape)
+
+
+
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+
+        debug_print(f"ATTN_DEBUG prefix_len={prefix_pad_masks.shape[1]}, suffix_len={suffix_embs.shape[1]}")
+
+
+
+
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -892,6 +1637,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
+
+
+
+        debug_print(f"ATTN_DEBUG denoise_step: prefix_len={prefix_len}, suffix_len={suffix_len}, attn_mask={full_att_2d_masks_4d.shape}")
+
+
         return self.action_out_proj(suffix_out)
 
 
@@ -1103,6 +1854,12 @@ class PI05Policy(PreTrainedPolicy):
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
+
+
+        debug_print("PI05: inside get_optim_params, returning model parameters for optimization")
+        debug_print(f"PI05: model parameters: {[name for name, _ in self.model.named_parameters()]}")
+
+
         return self.parameters()
 
     def reset(self):
@@ -1113,12 +1870,23 @@ class PI05Policy(PreTrainedPolicy):
         }
 
     def init_rtc_processor(self):
+
+
+        debug_print("PI05: inside init_rtc_processor, initializing RTC processor if enabled in config")
+
+
+
         """Initialize RTC processor if RTC is enabled in config."""
         self.rtc_processor = None
 
         # Create processor if config provided
         # If RTC is not enabled - we can still track the denoising data
         if self.config.rtc_config is not None:
+
+
+            debug_print("PI05: RTC config provided, initializing RTC processor")
+
+
             self.rtc_processor = RTCProcessor(self.config.rtc_config)
 
             model_value = getattr(self, "model", None)
@@ -1134,6 +1902,13 @@ class PI05Policy(PreTrainedPolicy):
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
         """
+
+
+
+        debug_print("PI05: inside PI05Policy._preprocess_images, batch keys:", batch.keys())
+
+
+
         images = []
         img_masks = []
 
@@ -1151,6 +1926,11 @@ class PI05Policy(PreTrainedPolicy):
 
         # Preprocess image features present in the batch
         for key in present_img_keys:
+
+
+            debug_print(f"PI05: preprocessing image feature: {key}, original shape: {batch[key].shape}, dtype: {batch[key].dtype}")
+
+
             img = batch[key]
 
             # Ensure tensor is on the same device as the model
@@ -1201,6 +1981,13 @@ class PI05Policy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+
+
+
+        debug_print("PI05: inside select_action, batch keys:", batch.keys())
+
+
+
         """Select a single action given environment observations."""
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
@@ -1218,6 +2005,13 @@ class PI05Policy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+
+
+
+        debug_print("PI05: inside predict_action_chunk, batch keys:", batch.keys(), "kwargs:", kwargs)
+
+
+
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
@@ -1235,6 +2029,12 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+
+
+        debug_print("PI05: inside PI05Policy.forward, batch keys:", batch.keys(), "reduction:", reduction)
+
+
+
         """Run the batch through the model and compute the loss for training.
 
         Args:

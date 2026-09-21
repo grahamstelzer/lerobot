@@ -102,6 +102,13 @@ def predict_action(
         torch.inference_mode(),
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
+
+
+
+
+
+        
+
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
         observation = prepare_observation_for_inference(observation, device, task, robot_type)
         observation = preprocessor(observation)
@@ -192,11 +199,13 @@ def sanity_check_dataset_name(repo_id, policy_cfg):
             f"Your dataset name begins with 'eval_' ({dataset_name}), but no policy is provided ({policy_cfg.type})."
         )
 
+# i think this is kinda silly. it does have a purpose tho? idk sohuld be more robust
+
     # Check if dataset_name does not start with "eval_" but policy is provided
-    if not dataset_name.startswith("eval_") and policy_cfg is not None:
-        raise ValueError(
-            f"Your dataset name does not begin with 'eval_' ({dataset_name}), but a policy is provided ({policy_cfg.type})."
-        )
+    # if not dataset_name.startswith("eval_") and policy_cfg is not None:
+    #     raise ValueError(
+    #         f"Your dataset name does not begin with 'eval_' ({dataset_name}), but a policy is provided ({policy_cfg.type})."
+    #     )
 
 
 def sanity_check_dataset_robot_compatibility(

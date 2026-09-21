@@ -33,10 +33,269 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-from ..pretrained import PreTrainedPolicy
-from .configuration_act import ACTConfig
+
+
+
+USE_FLASH_ATTENTION = True
+
+import torch.backends.cuda as cuda_backend
+
+print("flash enabled:", cuda_backend.flash_sdp_enabled())
+print("mem efficient enabled:", cuda_backend.mem_efficient_sdp_enabled())
+print("math enabled:", cuda_backend.math_sdp_enabled())
+
+# flash_attention.py
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+
+# check flash reqs:
+def is_flash_available(q, k, v):
+    # FlashAttention requires inputs to be on CUDA and in float16 or bfloat16
+    print("checking flash attention availability..."
+          f"\n q device: {q.device}, dtype: {q.dtype}"
+          f"\n k device: {k.device}, dtype: {k.dtype}"
+          f"\n v device: {v.device}, dtype: {v.dtype}")
+    if not q.is_cuda or not k.is_cuda or not v.is_cuda:
+        print("FlashAttention not available: inputs must be on CUDA.")
+        return False
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        print("FlashAttention not available: inputs must be float16 or bfloat16.")
+        return False
+    return True
+
+# check sdpa, DOES NOT WORK WITH OLDER PYTORCH VERSIONS
+# import torch._logging
+# torch._logging.set_logs(sdp=1)
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+
+class FlashAttention(nn.Module):
+    """
+    Drop-in replacement for nn.MultiheadAttention using PyTorch 2.0+
+    scaled_dot_product_attention, which dispatches to the FlashAttention
+    CUDA kernel automatically on GPU.
+
+    Matches nn.MultiheadAttention's __init__ and forward() signatures so you
+    can swap it with a single line change.
+
+    Usage:
+        # Before
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+
+        # After
+        self.self_attn = FlashAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        add_bias_kv: bool = False,       # accepted for API compat, not used
+        add_zero_attn: bool = False,     # accepted for API compat, not used
+        kdim: Optional[int] = None,
+        vdim: Optional[int] = None,
+        batch_first: bool = False,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.batch_first = batch_first
+        self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        # Separate projections (matches nn.MultiheadAttention internal layout)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+        self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias, **factory_kwargs)
+        self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        # Mirror nn.MultiheadAttention's Xavier init
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if self.q_proj.bias is not None:
+            nn.init.constant_(self.q_proj.bias, 0.0)
+            nn.init.constant_(self.k_proj.bias, 0.0)
+            nn.init.constant_(self.v_proj.bias, 0.0)
+            nn.init.constant_(self.out_proj.bias, 0.0)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = True,       # accepted; always returns None for weights
+        attn_mask: Optional[torch.Tensor] = None,
+        average_attn_weights: bool = True,  # accepted for API compat
+        is_causal: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args match nn.MultiheadAttention.forward exactly.
+
+        query:            (T, B, E)  if batch_first=False  [default]
+                          (B, T, E)  if batch_first=True
+        key, value:       same convention
+        key_padding_mask: (B, S) bool — True = ignore that position
+        attn_mask:        (T, S) or (B*H, T, S) additive float mask
+
+        Returns:
+            attn_output:        same shape as query
+            attn_output_weights: always None (FlashAttention does not materialise them)
+        """
+
+        # --- normalise to (B, T, E) internally ---
+        if not self.batch_first:
+            query = query.transpose(0, 1)   # (T,B,E) → (B,T,E)
+            key   = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+
+        B, T, E = query.shape
+        S = key.shape[1]
+        H = self.num_heads
+        Dh = self.head_dim
+
+        # --- project ---
+        q = self.q_proj(query)   # (B, T, E)
+        k = self.k_proj(key)     # (B, S, E)
+        v = self.v_proj(value)   # (B, S, E)
+
+        # --- reshape to (B, H, seq, head_dim) for SDPA ---
+        q = q.view(B, T, H, Dh).transpose(1, 2)   # (B, H, T, Dh)
+        k = k.view(B, S, H, Dh).transpose(1, 2)   # (B, H, S, Dh)
+        v = v.view(B, S, H, Dh).transpose(1, 2)   # (B, H, S, Dh)
+
+
+
+
+        # cast to fp16 for flash attn
+        orig_dtype = q.dtype
+        if q.dtype == torch.float32:
+            q = q.half()
+            k = k.half()
+            v = v.half()
+            if attn_mask is not None:
+                attn_mask = attn_mask.half()
+
+
+
+
+        # --- build additive attention mask ---
+        merged_mask: Optional[torch.Tensor] = None
+
+        if attn_mask is not None:
+            # attn_mask can be (T, S) or (B*H, T, S) — broadcast to (B, H, T, S)
+            if attn_mask.dim() == 2:
+                merged_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1,1,T,S)
+            elif attn_mask.dim() == 3:
+                merged_mask = attn_mask.view(B, H, T, S)
+
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, S) bool → additive (B, 1, 1, S)
+            pad_mask = key_padding_mask.to(dtype=q.dtype)
+            pad_mask = pad_mask.masked_fill(key_padding_mask, float("-inf"))
+            pad_mask = pad_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,S)
+            merged_mask = pad_mask if merged_mask is None else merged_mask + pad_mask
+
+        # --- FlashAttention kernel via SDPA ---
+        # On GPU this dispatches to the efficient attention backend (FA2 when available).
+        # is_causal=True passes the causal mask inside the kernel — faster than
+        # building an explicit upper-triangular mask.
+        dropout_p = self.dropout if self.training else 0.0
+
+
+
+        print("inputs into sdp: ", q.shape, k.shape, v.shape, merged_mask.shape if merged_mask is not None else None)
+
+        print("is flash available?: ", is_flash_available(q, k, v))
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=merged_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )   # (B, H, T, Dh)
+
+
+        # cast back to original dtype if needed
+        if attn_out.dtype != orig_dtype:
+            attn_out = attn_out.to(orig_dtype)
+
+
+
+        # --- reassemble heads ---
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, E)  # (B, T, E)
+        attn_out = self.out_proj(attn_out)
+
+        # --- restore original shape convention ---
+        if not self.batch_first:
+            attn_out = attn_out.transpose(0, 1)   # (B,T,E) → (T,B,E)
+
+        # Second return value matches nn.MultiheadAttention (weights or None)
+        return attn_out, None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -122,17 +381,39 @@ class ACTPolicy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
+
+
+
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
         self.eval()
 
         if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions = self.model(batch)[0]
+        # >>> INSERT CONTEXT HERE <<<
+        from torch.backends.cuda import sdp_kernel
+        # flash attention only: true false false
+        # math only: false true false
+        with sdp_kernel(
+            enable_flash=True,
+            enable_math=False,
+            enable_mem_efficient=True
+        ):
+
+            # print status of flash enabled:
+            print("flash enabled?: ", torch.backends.cuda.flash_sdp_enabled())
+
+            actions = self.model(batch)[0]
         return actions
+
+
+
+
+
+
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -142,10 +423,9 @@ class ACTPolicy(PreTrainedPolicy):
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
-        valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-        num_valid = valid_mask.sum() * abs_err.shape[-1]
-        l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
+        l1_loss = (
+            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
+        ).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:
@@ -534,7 +814,11 @@ class ACTEncoder(nn.Module):
 class ACTEncoderLayer(nn.Module):
     def __init__(self, config: ACTConfig):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+
+        if USE_FLASH_ATTENTION:
+            self.self_attn = FlashAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+        else:
+            self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 
         # Feed forward layers.
         self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
@@ -554,6 +838,14 @@ class ACTEncoderLayer(nn.Module):
         if self.pre_norm:
             x = self.norm1(x)
         q = k = x if pos_embed is None else x + pos_embed
+    
+
+        if USE_FLASH_ATTENTION:
+            print("using flash attention with shapes q: ", q.shape, "k:", k.shape, "v:", x.shape, "key_padding_mask:", key_padding_mask.shape if key_padding_mask is not None else None)
+        else:
+            print("using regular multihead attention with shapes q: ", q.shape, "k:", k.shape, "v:", x.shape, "key_padding_mask:", key_padding_mask.shape if key_padding_mask is not None else None)
+
+
         x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask)
         x = x[0]  # note: [0] to select just the output, not the attention weights
         x = skip + self.dropout1(x)
@@ -646,6 +938,9 @@ class ACTDecoderLayer(nn.Module):
         else:
             x = self.norm1(x)
             skip = x
+
+        print("calling multihead attention with shapes q: ", self.maybe_add_pos_embed(x, decoder_pos_embed).shape, "k:", self.maybe_add_pos_embed(encoder_out, encoder_pos_embed).shape, "v:", encoder_out.shape)
+
         x = self.multihead_attn(
             query=self.maybe_add_pos_embed(x, decoder_pos_embed),
             key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),

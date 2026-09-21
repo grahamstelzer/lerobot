@@ -1,0 +1,147 @@
+def extract_attention_heatmaps(
+    raw_camera_frames: list,
+    attn_buffer: dict[int, torch.Tensor] | None = None,
+    tokens_per_cam: int = 256,
+    patch_grid: int = 16,
+) -> list | None:
+    """
+    Converts the attention weights stored in _ATTN_BUFFER into per-camera
+    heatmap overlays on the original camera frames.
+
+    Must be called after sample_actions completes (buffer is populated) and
+    before _ATTN_BUFFER.clear() is called.
+
+    Args:
+        raw_camera_frames:
+            List of 3 numpy arrays, each shape [H, W, 3] uint8, in RGB order.
+            These are the ORIGINAL camera frames at their native resolution
+            (e.g. 480x640), not the 224x224 model inputs. The heatmap will be
+            upsampled to match whatever resolution these frames are.
+
+        tokens_per_cam:
+            Number of patch tokens per camera. 256 = 16x16 patches, confirmed
+            by trace L29: per_cam=256. Derived from image_size=224, patch_size=14.
+
+        patch_grid:
+            Square root of tokens_per_cam. 16x16=256. Used to reshape the flat
+            token sequence back into a spatial grid before upsampling.
+
+    Returns:
+        List of 3 numpy arrays, each [H, W, 3] uint8 BGR, ready for cv2 display
+        or concatenation into a video frame.
+        Returns None if _ATTN_BUFFER is empty (capture did not fire).
+    """
+    import numpy as np
+    import cv2
+
+    # ── GUARD ────────────────────────────────────────────────────────────────
+    # If the patch did not fire (e.g. model was not in inference mode, or
+    # chunk_size changed), return None rather than crashing.
+    # ─────────────────────────────────────────────────────────────────────────
+    buffer = attn_buffer if attn_buffer is not None else _ATTN_BUFFER
+
+    if not buffer:
+        logging.warning("extract_attention_heatmaps: buffer is empty, skipping.")
+        return None
+
+    # ── STEP 1: COLLECT AND AVERAGE ACROSS LAYERS ────────────────────────────
+    # Pull tensors for each capture layer in order. Each is [1, 8, 50, 1018].
+    # Stack along a new leading dimension then mean-reduce it, giving us one
+    # averaged tensor across the 4 layers: [1, 8, 50, 1018].
+    #
+    # We sort the keys so layer order is deterministic regardless of dict
+    # insertion order (Python 3.7+ dicts are ordered but explicit is safer).
+    layer_tensors = [
+        buffer[i]
+        for i in sorted(_CAPTURE_LAYERS)
+        if i in buffer
+    ]
+
+    if not layer_tensors:
+        logging.warning("extract_attention_heatmaps: no capture layers found in buffer.")
+        return None
+
+    # stacked: [4, 1, 8, 50, 1018]
+    stacked = torch.stack(layer_tensors, dim=0)
+    # mean over the 4 layers -> [1, 8, 50, 1018]
+    averaged_layers = stacked.mean(dim=0)
+
+    # ── STEP 2: AVERAGE ACROSS 8 ATTENTION HEADS ─────────────────────────────
+    # Each head has learned different attention patterns. Averaging collapses
+    # them into a single consensus view. This loses per-head information but
+    # gives a clean single heatmap per camera.
+    # [1, 8, 50, 1018] -> [1, 50, 1018]
+    averaged_heads = averaged_layers.mean(dim=1)
+
+    # ── STEP 3: DROP BATCH DIM AND AVERAGE OVER ACTION TIMESTEPS ─────────────
+    # squeeze(0): [1, 50, 1018] -> [50, 1018]
+    # Each of the 50 rows is one action timestep attending over 1018 keys.
+    # Averaging over timesteps gives one weight per key position representing
+    # the overall attention across the whole predicted action chunk.
+    # [50, 1018] -> [1018]
+    per_key = averaged_heads.squeeze(0).mean(dim=0)
+
+    # ── STEP 4: SLICE PER CAMERA AND BUILD HEATMAP ───────────────────────────
+    # Key sequence layout (confirmed trace L29):
+    #   cam1: positions   0 - 255   (256 tokens)
+    #   cam2: positions 256 - 511   (256 tokens)
+    #   cam3: positions 512 - 767   (256 tokens)
+    #   lang: positions 768 - 967   (200 tokens) - not used here
+    #   action: positions 968-1017  (50 tokens)  - not used here
+    #
+    # We only process the image portion (first tokens_per_cam * n_cams values).
+    heatmaps = []
+
+    for cam_idx, frame in enumerate(raw_camera_frames):
+
+        # Slice the 256 attention weights belonging to this camera
+        start = cam_idx * tokens_per_cam          # 0, 256, 512
+        end   = start + tokens_per_cam            # 256, 512, 768
+        cam_weights = per_key[start:end]          # [256] - one weight per patch
+
+        # ── STEP 5: RESHAPE TO SPATIAL GRID ──────────────────────────────────
+        # The 256 patch tokens are laid out in raster order (left-to-right,
+        # top-to-bottom) matching the original image grid. Reshape restores
+        # the 2D spatial structure so interpolation is spatially coherent.
+        # [256] -> [16, 16]
+        grid = cam_weights.reshape(patch_grid, patch_grid).float()
+
+        # ── STEP 6: NORMALIZE TO [0, 1] ──────────────────────────────────────
+        # Attention weights after softmax already sum to 1 across keys, but
+        # the absolute values are small and uneven across cameras. Per-camera
+        # normalization ensures the full colormap range is used for each view.
+        grid_min = grid.min()
+        grid_max = grid.max()
+        grid = (grid - grid_min) / (grid_max - grid_min + 1e-8)
+
+        # ── STEP 7: UPSAMPLE TO ORIGINAL FRAME RESOLUTION ────────────────────
+        # frame is [H, W, 3] - read H and W from the actual frame passed in.
+        # We do NOT hardcode 480x640 here so the function works with any camera.
+        #
+        # F.interpolate requires [N, C, H, W]. We add two dims, interpolate,
+        # then remove them to get back to [H, W].
+        H, W = frame.shape[:2]
+        grid_upsampled = F.interpolate(
+            grid.unsqueeze(0).unsqueeze(0),  # [1, 1, 16, 16]
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze().numpy()                  # [H, W]
+
+        # ── STEP 8: CONVERT TO COLORMAP ──────────────────────────────────────
+        # Scale [0,1] float -> [0,255] uint8, then apply JET colormap.
+        # JET: blue=low attention, green=medium, red=high attention.
+        # Output: [H, W, 3] BGR (cv2 native format).
+        heatmap_uint8 = (grid_upsampled * 255).astype(np.uint8)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+        # ── STEP 9: ALPHA BLEND ONTO ORIGINAL FRAME ──────────────────────────
+        # frame arrives as RGB uint8. cv2 works in BGR, so convert first.
+        # addWeighted: output = 0.55*original + 0.45*heatmap
+        # Weights are a tunable tradeoff - adjust to taste.
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        overlay = cv2.addWeighted(frame_bgr, 0.55, heatmap_color, 0.45, 0)
+
+        heatmaps.append(overlay)  # [H, W, 3] BGR uint8
+
+    return heatmaps  # list of 3 x [H, W, 3] BGR uint8

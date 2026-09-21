@@ -263,6 +263,17 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+ # fix for some walloss errors from git issue:
+
+        from lerobot.policies.wall_x.processor_wall_x import make_wall_x_pre_post_processors
+
+        processors = make_wall_x_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats")
+        )
+
+
+
         return (
             PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,

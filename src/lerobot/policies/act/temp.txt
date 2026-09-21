@@ -1,3 +1,6 @@
+most recent 6/30/26
+
+
 #!/usr/bin/env python
 
 # Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
@@ -33,10 +36,288 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-from ..pretrained import PreTrainedPolicy
-from .configuration_act import ACTConfig
+
+
+
+
+
+
+
+
+
+
+
+
+
+# backbone casting
+# targets aten::cudnn_convolution by autocast-ing convolutions to float16
+CAST_BACKBONE = False
+
+# nchw to nhwc timing bottleneck for resnet backbone, mitigated by setting the backbone to channels_last memory format
+# nchwToNhwcKernel definition: 
+USE_CHANNELS_LAST_BACKBONE = False
+
+# torch compile flags:
+# targest convolution kernels in the backbone, which are a bottleneck for inference, but may cause instability in the robot actions
+# TODO: investigate
+TORCH_COMPILE_ENCODER = False # poor inference results (robot arm jitter)
+TORCH_COMPILE_DECODER = False # poor inference results (robot arm jitter)
+TORCH_COMPILE_BACKBONE = False # robot operates ok but does not seem to be fully inferencing? (no side to side motion)
+
+
+import torch.nn.functional as F
+from torch.backends.cuda import flash_sdp_enabled, mem_efficient_sdp_enabled, math_sdp_enabled
+
+USE_FLASHMHA = False # fsdpa unless triton fa set to True
+USE_TRITON_FA_KERNEL = False
+
+
+
+
+
+
+
+"""
+=================================================================================================
+TRITON FLASH MHA KERNEL
+=================================================================================================
+"""
+
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def flash_attn_fwd_kernel(
+    Q, K, V, Out,
+    stride_qb, stride_qh, stride_qm,
+    stride_kb, stride_kh, stride_kn,
+    stride_vb, stride_vh, stride_vn,
+    stride_ob, stride_oh, stride_om,
+    B, H, M, N, Dh: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    # tile indices
+    start_m = tl.program_id(0)
+    off_bh = tl.program_id(1)
+    off_b = off_bh // H
+    off_h = off_bh % H
+
+    # pointers into Q, K, V per slice of (B, H)
+    Q_ptr = Q + off_b * stride_qb + off_h * stride_qh
+    K_ptr = K + off_b * stride_kb + off_h * stride_kh
+    V_ptr = V + off_b * stride_vb + off_h * stride_vh
+    O_ptr = Out + off_b * stride_ob + off_h * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M) # query rows for this tile
+    offs_d = tl.arange(0, Dh) # all head dims
+
+    # load Q tile into SRAM (stays in registers for the whole kernel)
+    q = tl.load(Q_ptr + offs_m[:, None] * stride_qm + offs_d[None, :], mask=offs_m[:, None] < M)
+
+    # online softmax accumulators
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32) # max for each row
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) # normalizer for each row
+    acc = tl.zeros([BLOCK_M, Dh], dtype=tl.float32) # accumulator for the weighted sum of V
+
+    scale = (Dh ** -0.5)
+
+    for start_n in range(0, N, BLOCK_N):
+        # iterate over K, V tiles
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        # load K, V tiles into SRAM:
+        k = tl.load(K_ptr + offs_n[None, :] * stride_kn + offs_d[:, None], mask=offs_n[None, :] < N)
+        v = tl.load(V_ptr + offs_n[:, None] * stride_vn + offs_d[None, :], mask=offs_n[:, None] < N)
+
+        # QK^T:
+        s = tl.dot(q, k) * scale # shape (BLOCK_M, BLOCK_N)
+
+        # online softmax:
+        m_new = tl.maximum(m_i, tl.max(s, axis=1)) # shape (BLOCK_M,)
+        alpha = tl.exp(m_i - m_new) # 
+        beta = tl.exp(s - m_new[:, None])
+        l_i = alpha * l_i + tl.sum(beta, axis=1) # shape (BLOCK_M,)
+        acc = alpha[:, None] * acc + tl.dot(beta.to(tl.float16), v)
+        m_i = m_new
+
+    # normalize:
+    acc = acc / l_i[:, None]
+
+    # write out:
+    tl.store(O_ptr + offs_m[:, None] * stride_om + offs_d[None, :] , acc.to(tl.float16), mask=offs_m[:, None] < M)
+
+
+def triton_flash_attn(q, k, v):
+    """q, k, v: (B, H, T, Dh) fp16 tensors on CUDA
+    returns: (B, H, T, Dh) fp16
+    """
+    B, H, M, Dh = q.shape
+    N = k.shape[2]
+
+    out = torch.empty_like(q)
+
+    BLOCK_M, BLOCK_N = 64, 64
+
+    grid = (triton.cdiv(M, BLOCK_M), B * H)
+
+    flash_attn_fwd_kernel[grid](
+        q, k, v, out,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        B, H, M, N, Dh,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+    )
+
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+=================================================================================================
+PYTHON FLASH MHA WRAPPER
+- flags determine torch F.sdpa which uses FA if available or triton kernel
+
+=================================================================================================
+"""
+
+# flash mla implementation
+# meant to replace any torch.nn.MultiHeadAttention layers in order to aboid paraemeter layout issues
+class FlashMHA(nn.MultiheadAttention):
+    """
+    uses F.sdpa which should enable flash attn if system qualifications are present
+    - gpu supports FA (sm80+)
+    - torch > 2.0
+    - some other third thing
+    """
+    def forward(self,
+                query,
+                key,
+                value,
+                key_padding_mask=None,
+                need_weight=True,
+                attn_mask=None,
+                average_attn_weights=True,
+                is_causal=False
+    ):
+
+        # print("calling flash mha forward")
+
+        if not self.batch_first:
+            query, key, value = [x.transpose(0,1) for x in (query, key, value)]
+
+        B, T, E = query.shape
+        S = key.shape[1]
+        H = self.num_heads
+        Dh = E // H
+
+        W = self.in_proj_weight
+        b = self.in_proj_bias
+        q = F.linear(query, W[0:E], b[0:E]     if b is not None else None)
+        k = F.linear(key  , W[E:2*E], b[E:2*E] if b is not None else None)
+        v = F.linear(value, W[2*E:], b[2*E:]   if b is not None else None)
+
+        q = q.view(B, T, H, Dh).transpose(1, 2)
+        k = k.view(B, S, H, Dh).transpose(1, 2)
+        v = v.view(B, S, H, Dh).transpose(1, 2)
+
+        merged_mask = None
+        if attn_mask is not None:
+            merged_mask = attn_mask.unsqueeze(0).unsqueeze(0) if attn_mask.dim() == 2 else attn_mask.view(B, H, T, S)
+
+        if key_padding_mask is not None:
+            pad = torch.zeros(B, 1, 1, S, dtype=q.dtype, device=q.device)
+            pad = pad.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+            merged_mask = pad if merged_mask is None else merged_mask + pad
+
+        # flash attention requires float16 or bfloat16 dtypes
+        orig_dtype = q.dtype
+        if q.is_cuda and q.dtype == torch.float32:
+            q, k, v = q.half(), k.half(), v.half()
+            if merged_mask is not None:
+                merged_mask = merged_mask.half()
+
+
+
+
+        # print(f"flash enabled: {flash_sdp_enabled()}")
+        # print(f"mem_efficient enabled: {mem_efficient_sdp_enabled()}")
+        # print(f"math enabled: {math_sdp_enabled()}")
+        # print(f"merged mask: {merged_mask is not None}")
+        # print(f"q, k, v dtype: {q.dtype}, {k.dtype}, {v.dtype}")
+
+
+        if USE_TRITON_FA_KERNEL:
+            # print("using triton flash attn")
+            out = triton_flash_attn(q, k, v).to(orig_dtype)
+        else:
+            # print("using torch scaled dot product attn")
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=merged_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=is_causal
+            ).to(orig_dtype)
+
+
+
+
+        out = out.transpose(1, 2).contiguous().view(B, T, E)
+        out = F.linear(out, self.out_proj.weight, self.out_proj.bias)
+
+        if not self.batch_first:
+            out = out.transpose(0, 1)
+
+        return out, None
+
+
+# replacer helper, searches module list for pytorch version and replaces
+def replace_mha_with_flash(module: nn.Module) -> nn.Module:
+    for name, child in module.named_children():
+        if isinstance(child, nn.MultiheadAttention):
+            # build flashmha with identical constructor args
+            flash = FlashMHA(
+                embed_dim=child.embed_dim,
+                num_heads=child.num_heads,
+                dropout=child.dropout,
+                bias=child.in_proj_bias is not None,
+                batch_first=child.batch_first,
+                kdim=child.kdim,
+                vdim=child.vdim,
+            )
+            setattr(module, name, flash)
+        else:
+            replace_mha_with_flash(child)
+    return module
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -62,7 +343,31 @@ class ACTPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        self.model = ACT(config)
+
+
+
+        if USE_FLASHMHA:
+            # print("using f.sdpa > flash mha")
+            self.model = replace_mha_with_flash(ACT(config))
+        else:
+            # print("using torch.nn.MultiheadAttention")
+            self.model = ACT(config)
+
+
+        # torch compile:
+        # self.model.encoder = torch.compile(self.model.encoder, mode="reduce-overhead", fullgraph=True)
+        # self.model.decoder = torch.compile(self.model.decoder, mode="reduce-overhead", fullgraph=True)
+        # self.model.backbone = torch.compile(self.model.backbone, mode="reduce-overhead", fullgraph=False)
+
+        if TORCH_COMPILE_ENCODER:
+            self.model.encoder = torch.compile(self.model.encoder, mode="reduce-overhead", fullgraph=False)
+        if TORCH_COMPILE_DECODER:
+            self.model.decoder = torch.compile(self.model.decoder, mode="reduce-overhead", fullgraph=False)
+        if self.config.image_features and TORCH_COMPILE_BACKBONE:
+            self.model.backbone = torch.compile(self.model.backbone, mode="reduce-overhead", fullgraph=False)
+
+
+
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -97,7 +402,8 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    @torch.inference_mode()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
@@ -106,6 +412,33 @@ class ACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
+
+
+
+
+
+
+        # # check resnet bottleneck:
+        # # NOTE: profiler adds overhead? since called multiple times per step?
+        # from torch.profiler import profile, ProfilerActivity, record_function
+
+        # with profile(
+        #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        #     record_shapes=True,
+        #     with_stack=False,
+        # ) as prof:
+        #     with torch.no_grad():
+        #         for _ in range(20):
+        #             actions = self.predict_action_chunk(batch)
+
+        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+
+
+
+
+
+
+
 
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
@@ -122,7 +455,8 @@ class ACTPolicy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    @torch.inference_mode()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
@@ -142,10 +476,9 @@ class ACTPolicy(PreTrainedPolicy):
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
-        valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-        num_valid = valid_mask.sum() * abs_err.shape[-1]
-        l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
+        l1_loss = (
+            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
+        ).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:
@@ -333,6 +666,13 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
+
+            # channels_last memory format to eliminate nchwToNhwc timing
+            if USE_CHANNELS_LAST_BACKBONE:
+                self.backbone = self.backbone.to(memory_format=torch.channels_last)
+
+
+
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
@@ -472,7 +812,20 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
+
+
+                if CAST_BACKBONE:
+                    img = img.to(memory_format=torch.channels_last)  # (B, C, H, W)
+
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+                        cam_features = self.backbone(img)["feature_map"]
+                    # exits autocast as fp16, cast back
+                    cam_features = cam_features.float()
+                else:
+                    cam_features = self.backbone(img)["feature_map"]
+
+
+
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
